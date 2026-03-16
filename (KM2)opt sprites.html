@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Otimizador de Sprites</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #11111b; color: #cdd6f4; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        .container { background-color: #1e1e2e; padding: 25px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); max-width: 700px; width: 100%; border: 1px solid #313244; }
+        h1 { color: #f9e2af; text-align: center; margin-top: 0; }
+        .input-group { margin: 15px 0; }
+        label { font-weight: bold; display: block; margin-bottom: 5px; color: #b4befe; font-size: 13px; }
+        input, select { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #45475a; background-color: #181825; color: #cdd6f4; box-sizing: border-box; }
+        .options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+        .option-box { background-color: #181825; padding: 10px; border-radius: 8px; border: 1px dashed #45475a; }
+        button { background-color: #a6e3a1; color: #11111b; border: none; padding: 15px; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; width: 100%; transition: 0.2s; }
+        button:hover { background-color: #94e2d5; transform: translateY(-2px); }
+        #status { margin-top: 15px; text-align: center; font-weight: bold; }
+        #preview-container { display: none; margin-top: 20px; background-color: #1e1e2e; padding: 20px; border-radius: 12px; border: 1px solid #89b4fa; width: 100%; max-width: 700px; text-align: center; }
+        canvas { background-color: #181825; border: 1px solid #45475a; border-radius: 8px; max-width: 100%; height: auto; margin-top: 10px; }
+        .info-badge { background: #313244; color: #a6e3a1; padding: 5px 10px; border-radius: 4px; font-size: 12px; margin-bottom: 10px; font-weight: bold; display: inline-block; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>Otimizador de sprites (KM2)</h1>
+        <div class="input-group">
+            <label>Escala (0.1 até 1.0):</label>
+            <input type="number" id="scale" min="0.1" max="1.0" step="0.1" value="0.5">
+        </div>
+        <div class="options-grid">
+            <div class="option-box">
+                <input type="checkbox" id="chkTrim" checked> <label style="display:inline" for="chkTrim">Trimming (Corte Ágil)</label><br>
+                <input type="checkbox" id="chkDedupe" checked> <label style="display:inline" for="chkDedupe">Deduplicação IA</label>
+            </div>
+            <div class="option-box">
+                <label>Padding entre Frames (px):</label>
+                <input type="number" id="padding" value="2" min="0" max="10">
+            </div>
+        </div>
+        <div class="input-group">
+            <label>Selecione PNGs e XMLs (até 20 pares):</label>
+            <input type="file" id="files" multiple accept=".png,.xml">
+        </div>
+        <button id="btnOtimizar" onclick="iniciarOtimizacao()">Otimizar e Gerar Pack 📦</button>
+        <div id="status"></div>
+    </div>
+
+    <div id="preview-container">
+        <div id="tamanhoFinalBadge" class="info-badge">Tamanho: 0x0</div>
+        <div style="display: flex; gap: 10px; text-align: left; margin-bottom: 10px;">
+            <div style="flex: 1;">
+                <label>Personagem:</label>
+                <select id="sheetSelect" onchange="mudarSpritesheet()"></select>
+            </div>
+            <div style="flex: 1;">
+                <label>FPS:</label>
+                <input type="number" id="fpsInput" value="24" min="1" max="50" onchange="aplicarFPS()">
+            </div>
+        </div>
+        <canvas id="previewCanvas"></canvas>
+    </div>
+
+    <script>
+        const readFileAsText = file => new Promise(res => { const r = new FileReader(); r.onload = e => res(e.target.result); r.readAsText(file); });
+        const loadImage = file => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = URL.createObjectURL(file); });
+
+        function getTrimBounds(ctx, w, h) {
+            const data = ctx.getImageData(0, 0, w, h).data;
+            let t = h, l = w, r = 0, b = 0, hasP = false;
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    if (data[(y * w + x) * 4 + 3] > 0) {
+                        hasP = true; if (x < l) l = x; if (x > r) r = x; if (y < t) t = y; if (y > b) b = y;
+                    }
+                }
+            }
+            return hasP ? { x: l, y: t, w: r - l + 1, h: b - t + 1 } : null;
+        }
+
+        async function processarPar(imgFile, xmlFile, config) {
+            const img = await loadImage(imgFile);
+            const xmlDoc = new DOMParser().parseFromString(await readFileAsText(xmlFile), "text/xml");
+            const subTextures = Array.from(xmlDoc.getElementsByTagName("SubTexture"));
+            const tempCtx = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+
+            let frames = [], uniqueFrames = [], totalArea = 0;
+
+            for (let st of subTextures) {
+                let f = {
+                    name: st.getAttribute("name"), x: parseInt(st.getAttribute("x")), y: parseInt(st.getAttribute("y")),
+                    w: parseInt(st.getAttribute("width")), h: parseInt(st.getAttribute("height")),
+                    fx: st.hasAttribute("frameX") ? parseInt(st.getAttribute("frameX")) : 0,
+                    fy: st.hasAttribute("frameY") ? parseInt(st.getAttribute("frameY")) : 0,
+                    fw: st.hasAttribute("frameWidth") ? parseInt(st.getAttribute("frameWidth")) : parseInt(st.getAttribute("width")),
+                    fh: st.hasAttribute("frameHeight") ? parseInt(st.getAttribute("frameHeight")) : parseInt(st.getAttribute("height"))
+                };
+
+                tempCtx.canvas.width = f.w; tempCtx.canvas.height = f.h;
+                tempCtx.drawImage(img, f.x, f.y, f.w, f.h, 0, 0, f.w, f.h);
+                let bounds = config.useTrim ? getTrimBounds(tempCtx, f.w, f.h) : { x: 0, y: 0, w: f.w, h: f.h };
+
+                if (!bounds) { f.isEmpty = true; frames.push(f); continue; }
+
+                let crop = document.createElement('canvas');
+                crop.width = bounds.w; crop.height = bounds.h;
+                crop.getContext('2d').drawImage(tempCtx.canvas, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, bounds.w, bounds.h);
+
+                f.canvas = crop; f.origW = bounds.w; f.origH = bounds.h; f.fx -= bounds.x; f.fy -= bounds.y;
+
+                if (config.useDedupe) {
+                    let hash = crop.toDataURL();
+                    let dup = uniqueFrames.find(u => u.hash === hash);
+                    if (dup) { f.isDup = true; f.dupOf = dup; } else { f.hash = hash; uniqueFrames.push(f); }
+                } else { uniqueFrames.push(f); }
+                frames.push(f);
+            }
+
+            uniqueFrames.sort((a, b) => b.origH - a.origH);
+            uniqueFrames.forEach(f => {
+                f.sW = Math.max(1, Math.round(f.origW * config.scale));
+                f.sH = Math.max(1, Math.round(f.origH * config.scale));
+                totalArea += (f.sW + config.pad) * (f.sH + config.pad);
+            });
+
+            // Lógica de Canvas Justo: Calcula largura ideal para ser o mais compacto possível
+            let targetW = Math.max(uniqueFrames[0].sW, Math.ceil(Math.sqrt(totalArea) * 1.1));
+            let curX = 0, curY = 0, rowH = 0, finW = 0, finH = 0;
+
+            uniqueFrames.forEach(f => {
+                if (curX + f.sW > targetW) { curX = 0; curY += rowH; rowH = 0; }
+                f.nX = curX; f.nY = curY;
+                curX += f.sW + config.pad; rowH = Math.max(rowH, f.sH + config.pad);
+                finW = Math.max(finW, curX); finH = Math.max(finH, curY + rowH);
+            });
+
+            const finalCanvas = document.createElement('canvas');
+            finalCanvas.width = finW; finalCanvas.height = finH;
+            const ctx = finalCanvas.getContext('2d');
+            uniqueFrames.forEach(f => ctx.drawImage(f.canvas, 0, 0, f.origW, f.origH, f.nX, f.nY, f.sW, f.sH));
+
+            let xml = `<?xml version="1.0" encoding="utf-8"?>\n<TextureAtlas imagePath="${imgFile.name}">\n`;
+            frames.forEach(f => {
+                let sfx = Math.round(f.fx * config.scale), sfy = Math.round(f.fy * config.scale);
+                let sfw = Math.round(f.fw * config.scale), sfh = Math.round(f.fh * config.scale);
+                if (f.isEmpty) xml += `\t<SubTexture name="${f.name}" x="0" y="0" width="1" height="1" frameX="${sfx}" frameY="${sfy}" frameWidth="${sfw}" frameHeight="${sfh}"/>\n`;
+                else {
+                    let t = f.isDup ? f.dupOf : f;
+                    xml += `\t<SubTexture name="${f.name}" x="${t.nX}" y="${t.nY}" width="${t.sW}" height="${t.sH}" frameX="${sfx}" frameY="${sfy}" frameWidth="${sfw}" frameHeight="${sfh}"/>\n`;
+                }
+            });
+            xml += `</TextureAtlas>`;
+
+            return new Promise(res => finalCanvas.toBlob(b => res({ blob: b, xml, w: finW, h: finH }), "image/png"));
+        }
+
+        let previews = {}, current = { loop: null, frame: 0, sheet: "" };
+
+        async function iniciarOtimizacao() {
+            const files = document.getElementById('files').files;
+            if (files.length === 0) return alert("Selecione os arquivos!");
+            const config = { scale: parseFloat(document.getElementById('scale').value), pad: parseInt(document.getElementById('padding').value), useTrim: document.getElementById('chkTrim').checked, useDedupe: document.getElementById('chkDedupe').checked };
+            
+            const status = document.getElementById('status');
+            status.innerText = "Otimizando... ⏳";
+            
+            const grupos = {};
+            for (let f of files) {
+                let n = f.name.substring(0, f.name.lastIndexOf('.'));
+                let e = f.name.split('.').pop().toLowerCase();
+                if (!grupos[n]) grupos[n] = {}; grupos[n][e] = f;
+            }
+
+            const zip = new JSZip();
+            previews = {};
+
+            for (let n in grupos) {
+                if (grupos[n].png && grupos[n].xml) {
+                    const res = await processarPar(grupos[n].png, grupos[n].xml, config);
+                    zip.file(n + ".png", res.blob); zip.file(n + ".xml", res.xml);
+                    
+                    // Preparar Preview
+                    let img = new Image(); img.src = URL.createObjectURL(res.blob);
+                    await new Promise(r => img.onload = r);
+                    let anims = {};
+                    new DOMParser().parseFromString(res.xml, "text/xml").querySelectorAll("SubTexture").forEach(st => {
+                        let name = st.getAttribute("name").replace(/\d+$/, '').trim();
+                        if (!anims[name]) anims[name] = [];
+                        anims[name].push({ x: parseInt(st.getAttribute("x")), y: parseInt(st.getAttribute("y")), w: parseInt(st.getAttribute("width")), h: parseInt(st.getAttribute("height")), fx: parseInt(st.getAttribute("frameX")), fy: parseInt(st.getAttribute("frameY")), fw: parseInt(st.getAttribute("frameWidth")), fh: parseInt(st.getAttribute("frameHeight")) });
+                    });
+                    previews[n] = { img, anims, w: res.w, h: res.h };
+                }
+            }
+
+            const content = await zip.generateAsync({ type: "blob" });
+            const a = document.createElement('a'); a.href = URL.createObjectURL(content); a.download = "Sprites_Otimizados.zip"; a.click();
+            
+            status.innerText = "✅ Pronto! Download realizado.";
+            popularSelects();
+        }
+
+        function popularSelects() {
+            const s = document.getElementById("sheetSelect"); s.innerHTML = "";
+            for (let n in previews) { let o = document.createElement("option"); o.value = n; o.text = n; s.appendChild(o); }
+            document.getElementById("preview-container").style.display = "block";
+            mudarSpritesheet();
+        }
+
+        function mudarSpritesheet() {
+            current.sheet = document.getElementById("sheetSelect").value;
+            const p = previews[current.sheet];
+            document.getElementById("tamanhoFinalBadge").innerText = `Tamanho Real: ${p.w} x ${p.h} px`;
+            aplicarFPS();
+        }
+
+        function aplicarFPS() {
+            if (current.loop) clearInterval(current.loop);
+            current.loop = setInterval(draw, 1000 / parseInt(document.getElementById("fpsInput").value));
+        }
+
+        function draw() {
+            const p = previews[current.sheet];
+            const canvas = document.getElementById("previewCanvas");
+            const ctx = canvas.getContext("2d");
+            const animName = Object.keys(p.anims)[0]; // Pega a primeira animação por padrão
+            const anim = p.anims[animName];
+            const f = anim[current.frame % anim.length];
+            canvas.width = f.fw; canvas.height = f.fh;
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            ctx.drawImage(p.img, f.x, f.y, f.w, f.h, -f.fx, -f.fy, f.w, f.h);
+            current.frame++;
+        }
+    </script>
+</body>
+</html>
